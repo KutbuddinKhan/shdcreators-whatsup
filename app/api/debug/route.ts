@@ -1,31 +1,28 @@
-/**
- * app/api/debug/route.ts
- * Temporary debug endpoint — DELETE after fixing.
- * Visit: https://your-vercel-url.vercel.app/api/debug
- */
-
 import { NextResponse } from "next/server";
 
 export async function GET(): Promise<NextResponse> {
-  const geminiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GROQ_API_KEY;
 
-  if (!geminiKey) {
+  if (!apiKey) {
     return NextResponse.json(
-      { error: "GEMINI_API_KEY is not set in env" },
+      { error: "GROQ_API_KEY is not set" },
       { status: 500 },
     );
   }
 
-  // Test the Gemini API directly
   try {
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key=${geminiKey}`,
+      "https://api.groq.com/openai/v1/chat/completions",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
         body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: "Say: working" }] }],
-          generationConfig: { maxOutputTokens: 50 },
+          model: "llama-3.3-70b-versatile",
+          messages: [{ role: "user", content: "Say: working" }],
+          max_tokens: 10,
         }),
       },
     );
@@ -34,7 +31,7 @@ export async function GET(): Promise<NextResponse> {
 
     return NextResponse.json({
       status: response.status,
-      keyPrefix: geminiKey.substring(0, 8) + "...",
+      keyPrefix: apiKey.substring(0, 8) + "...",
       response: data,
     });
   } catch (err: unknown) {
