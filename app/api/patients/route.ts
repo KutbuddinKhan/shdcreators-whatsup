@@ -1,11 +1,6 @@
 /**
  * app/api/patients/route.ts
- * ─────────────────────────────────────────────────────────────
- * GET /api/patients
- * Returns all unique patients with their last message summary,
- * intent, total message count, and first/last contact dates.
- * Used by the dashboard on initial load.
- * ─────────────────────────────────────────────────────────────
+ * GET /api/patients — includes unread count per patient
  */
 
 import { NextResponse } from "next/server";
@@ -18,29 +13,26 @@ export interface PatientSummary {
   lastIntent: string;
   totalMessages: number;
   firstContactAt: string;
+  unreadCount: number;
 }
 
 export async function GET(): Promise<NextResponse> {
   try {
     const supabase = getSupabaseClient();
 
-    // Fetch all messages — we'll aggregate in JS
-    // (Supabase free tier doesn't support window functions via the REST API)
     const { data, error } = await supabase
       .from("messages")
-      .select("patient_phone, content, intent, created_at, direction")
+      .select("patient_phone, content, intent, created_at, direction, is_read")
       .order("created_at", { ascending: true });
 
-    if (error) {
-      console.error("[/api/patients] Supabase error:", error.message);
+    if (error)
       return NextResponse.json({ error: "Database error" }, { status: 500 });
-    }
 
-    // Group by patient_phone
     const map = new Map<string, PatientSummary>();
 
     for (const row of data ?? []) {
       const existing = map.get(row.patient_phone);
+      const isUnread = row.direction === "inbound" && !row.is_read;
 
       if (!existing) {
         map.set(row.patient_phone, {
@@ -50,16 +42,17 @@ export async function GET(): Promise<NextResponse> {
           lastIntent: row.intent,
           totalMessages: 1,
           firstContactAt: row.created_at,
+          unreadCount: isUnread ? 1 : 0,
         });
       } else {
         existing.lastMessage = row.content;
         existing.lastMessageAt = row.created_at;
         existing.lastIntent = row.intent;
         existing.totalMessages += 1;
+        if (isUnread) existing.unreadCount += 1;
       }
     }
 
-    // Sort newest first
     const patients = Array.from(map.values()).sort(
       (a, b) =>
         new Date(b.lastMessageAt).getTime() -
@@ -67,8 +60,7 @@ export async function GET(): Promise<NextResponse> {
     );
 
     return NextResponse.json(patients);
-  } catch (err) {
-    console.error("[/api/patients] Unexpected error:", err);
+  } catch {
     return NextResponse.json({ error: "Server error" }, { status: 500 });
   }
 }

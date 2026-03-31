@@ -1,43 +1,42 @@
 /**
  * app/api/messages/[phone]/route.ts
- * ─────────────────────────────────────────────────────────────
- * GET /api/messages/[phone]
- * Returns all messages for a given patient phone number,
- * ordered by created_at ascending (oldest first).
- * ─────────────────────────────────────────────────────────────
+ * GET /api/messages/[phone]?after=ISO_TIMESTAMP
+ * Returns all messages, or only messages after a given timestamp.
  */
 
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseClient } from "@/lib/supabase";
 
 export async function GET(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ phone: string }> },
 ): Promise<NextResponse> {
   try {
     const { phone } = await params;
-
-    if (!phone) {
-      return NextResponse.json({ error: "Phone is required" }, { status: 400 });
-    }
+    if (!phone)
+      return NextResponse.json({ error: "Phone required" }, { status: 400 });
 
     const decoded = decodeURIComponent(phone);
+    const after = new URL(req.url).searchParams.get("after");
     const supabase = getSupabaseClient();
 
-    const { data, error } = await supabase
+    let query = supabase
       .from("messages")
       .select("*")
       .eq("patient_phone", decoded)
       .order("created_at", { ascending: true });
 
-    if (error) {
-      console.error("[/api/messages] Supabase error:", error.message);
-      return NextResponse.json({ error: "Database error" }, { status: 500 });
+    // If ?after= is provided, only return newer messages
+    if (after) {
+      query = query.gt("created_at", after);
     }
 
+    const { data, error } = await query;
+
+    if (error)
+      return NextResponse.json({ error: "Database error" }, { status: 500 });
     return NextResponse.json(data ?? []);
-  } catch (err) {
-    console.error("[/api/messages] Unexpected error:", err);
+  } catch {
     return NextResponse.json({ error: "Server error" }, { status: 500 });
   }
 }
