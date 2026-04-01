@@ -1,6 +1,6 @@
 /**
  * app/api/webhook/route.ts
- * Complete replacement — guaranteed fast response + reliable async processing
+ * WhatsApp webhook — respects per-patient AI on/off toggle
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -35,8 +35,6 @@ interface WhatsAppPayload {
   entry?: WhatsAppEntry[];
 }
 
-// ── GET: Webhook verification ─────────────────────────────────
-
 export async function GET(req: NextRequest): Promise<NextResponse> {
   const { searchParams } = new URL(req.url);
   const mode = searchParams.get("hub.mode");
@@ -47,50 +45,27 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     mode === "subscribe" &&
     token === process.env.WHATSAPP_WEBHOOKS_VERIFY_TOKEN
   ) {
-    console.log("[Webhook] Verified");
     return new NextResponse(challenge, { status: 200 });
   }
   return new NextResponse("Forbidden", { status: 403 });
 }
 
-// ── POST: Return 200 IMMEDIATELY, process async ───────────────
-
 export async function POST(req: NextRequest): Promise<NextResponse> {
-  // Parse body BEFORE returning — this is fast (<1ms)
   const body = (await req.json().catch(() => null)) as WhatsAppPayload | null;
-
-  // Return 200 to Meta RIGHT NOW — before doing anything else
-  // This MUST happen within 5 seconds or Meta will retry
-  const response = new NextResponse("OK", { status: 200 });
-
-  // Use waitUntil if available (Vercel Edge) — keeps function alive after response
-  // Falls back to fire-and-forget promise
-  if (
-    typeof (globalThis as typeof globalThis & { EdgeRuntime?: unknown })
-      .EdgeRuntime !== "undefined"
-  ) {
-    // Edge runtime — not needed here
-  }
-
-  // Fire and forget — do NOT await this
-  processMessage(body).catch((err) => {
-    console.error("[Webhook] Processing error:", err);
+  processIncomingMessage(body).catch((err: unknown) => {
+    console.error("[Webhook] Error:", err);
   });
-
-  return response;
+  return new NextResponse("OK", { status: 200 });
 }
 
-// ── Core processing — runs AFTER 200 is sent ─────────────────
-
-async function processMessage(body: WhatsAppPayload | null): Promise<void> {
-  const startTime = Date.now();
-
+async function processIncomingMessage(
+  body: WhatsAppPayload | null
+): Promise<void> {
+  let senderPhone = "";
   try {
     await ensureMessagesTable();
 
     const value = body?.entry?.[0]?.changes?.[0]?.value;
-
-    // Ignore status updates (read receipts, delivery receipts)
     if (value?.statuses) return;
 
     const messages = value?.messages ?? [];
@@ -100,18 +75,11 @@ async function processMessage(body: WhatsAppPayload | null): Promise<void> {
     const messageId = message?.id ?? "";
     const from = message?.from ?? "";
     const type = message?.type ?? "";
+    senderPhone = from;
 
     if (!from || !messageId) return;
+    if (await isDuplicateMessage(messageId)) return;
 
-    // Deduplicate — Meta sometimes sends the same message twice
-    if (await isDuplicateMessage(messageId)) {
-      console.log(`[Webhook] Duplicate ignored: ${messageId}`);
-      return;
-    }
-
-    console.log(`[Webhook] Processing message from ${from}, type: ${type}`);
-
-    // Handle non-text (image, audio, video, etc.)
     if (type !== "text") {
       const fallback =
         "Thanks for sending that — unfortunately I can only read text messages at the moment. Could you describe what you need and I'll do my best to help?";
@@ -119,10 +87,9 @@ async function processMessage(body: WhatsAppPayload | null): Promise<void> {
       await logMessage({
         patient_phone: from,
         direction: "inbound",
-        content: `[${type} message — not supported]`,
+        content: `[${type} message]`,
         intent: "general",
         whatsapp_message_id: messageId,
-        is_read: false,
         is_ai: false,
       });
       await logMessage({
@@ -131,7 +98,6 @@ async function processMessage(body: WhatsAppPayload | null): Promise<void> {
         content: fallback,
         intent: "general",
         is_ai: true,
-        is_read: true,
       });
       return;
     }
@@ -139,7 +105,6 @@ async function processMessage(body: WhatsAppPayload | null): Promise<void> {
     const inboundText = message?.text?.body ?? "";
     if (!inboundText.trim()) return;
 
-    // Log inbound immediately
     await logMessage({
       patient_phone: from,
       direction: "inbound",
@@ -150,64 +115,62 @@ async function processMessage(body: WhatsAppPayload | null): Promise<void> {
       is_ai: false,
     });
 
-    // Mark as read (fire and forget)
     void markMessageAsRead(messageId);
 
-    // Check AI toggle
     const aiEnabled = await isAIEnabled(from);
-    if (!aiEnabled) {
-      console.log(`[Webhook] AI disabled for ${from}`);
-      return;
-    }
+    if (!aiEnabled) return;
 
-    // Signal typing indicator
-    void fetch(
-      `${process.env.NEXTAUTH_URL ?? "https://shdcreators-whatsup.vercel.app"}/api/typing-status`,
-      {
+    // ── Signal typing indicator ON ────────────────────────────
+    try {
+      await fetch(`${process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "http://localhost:3000"}/api/typing-status`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ phone: from }),
-      },
-    ).catch(() => {});
+      });
+    } catch { /* non-critical */ }
 
-    // Get last 6 messages for AI context
     const recentMessages = await getRecentMessages(from, 6);
-
-    // Call Groq AI
     const { intent, reply } = await getAIResponse(recentMessages, inboundText);
 
-    // Clear typing indicator
-    void fetch(
-      `${process.env.NEXTAUTH_URL ?? "https://shdcreators-whatsup.vercel.app"}/api/typing-status`,
-      {
+    // ── Signal typing indicator OFF ───────────────────────────
+    try {
+      await fetch(`${process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "http://localhost:3000"}/api/typing-status`, {
         method: "DELETE",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ phone: from }),
-      },
-    ).catch(() => {});
+      });
+    } catch { /* non-critical */ }
 
-    // Log outbound
     await logMessage({
       patient_phone: from,
       direction: "outbound",
       content: reply,
       intent,
-      is_ai: true,
       is_read: true,
+      is_ai: true,
     });
 
-    // Update inbound intent
     const supabase = getSupabaseClient();
     void supabase
       .from("messages")
       .update({ intent })
       .eq("whatsapp_message_id", messageId);
 
-    // Send reply
     await sendWhatsAppMessage(from, reply);
-
-    console.log(`[Webhook] Done in ${Date.now() - startTime}ms`);
   } catch (err) {
-    console.error("[Webhook] Failed:", err);
+    console.error("[Webhook] Processing failed:", err);
+
+    // Clear typing indicator on error
+    if (senderPhone) {
+      try {
+        await fetch(`${process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "http://localhost:3000"}/api/typing-status`, {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ phone: senderPhone }),
+        });
+      } catch { /* non-critical */ }
+    }
   }
 }
+
+// VERCEL_URL=https://shdcreators-whatsup.vercel.app/
